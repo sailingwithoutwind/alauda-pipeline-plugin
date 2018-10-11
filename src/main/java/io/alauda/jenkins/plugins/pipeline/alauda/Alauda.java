@@ -163,13 +163,51 @@ public class Alauda {
         return AlaudaPath.getBuildUrl(this.getConsoleURL(), buildID);
     }
 
+    boolean monitorUpdateComponent(String clusterName, String namespace, String applicationName, String resourceType, String componentName, int timeout) throws InterruptedException, IOException {
+        DateTime deadline = new DateTime().plusMillis(timeout * 1000);
+        String workloadName = resourceType + "-" + componentName;
+        int sleepMillis = 10000; // 10s
+        int timer = 0;
+        while (true) {
+            if (deadline.isBeforeNow()) {
+                throw new InterruptedException(String.format("Timeout, more than %d seconds!", timeout));
+            }
+
+            ApplicationStatus appStatus;
+            try {
+                timer++;
+                appStatus = componentClient.retrieveApplicationStatus(clusterName, namespace, applicationName);
+                if (appStatus == null) {
+                    throw new IOException(String.format("Application %s Status can not find.", applicationName));
+                }
+                ApplicationStatus.ComponentStatus componentStatus = appStatus.getWorkloads().get(workloadName);
+                if (componentStatus == null) {
+                    throw new IOException(String.format("workload %s Status can not find.", workloadName));
+                } else {
+                    logger.printf("%d. Get component status: %s \n", timer, componentStatus.getStatus());
+                    if (componentStatus.isFinalStatus()) {
+                        return componentStatus.isSucc();
+                    }
+                }
+            } catch (IOException ex) {
+                if (!ex.getMessage().contains("Unexpected code")) {
+                    logger.printf("%d. Monitor status error %s , will try again \n", timer, ex.getMessage());
+                }
+            } finally {
+                this.listener.getLogger().flush();
+            }
+
+            Thread.sleep(sleepMillis);
+        }
+    }
+
     boolean monitorUpdateService(String serviceID, int timeout) throws InterruptedException, IOException {
         DateTime deadline = new DateTime().plusMillis(timeout * 1000);
         int sleepMillis = 10000; // 10s
         int timer = 0;
         while (true) {
             if (deadline.isBeforeNow()) {
-                throw new InterruptedException(String.format("Timeout, more than %d minutes!", timeout));
+                throw new InterruptedException(String.format("Timeout, more than %d seconds!", timeout));
             }
 
             ServiceDetails details;
@@ -350,10 +388,28 @@ public class Alauda {
         return componentClient.retrieveComponent(applicationName, resourceType, componentName, clusterName, namespace, projectName);
     }
 
-    public String updateComponent(String clusterName, String resourceType, String namespace, String componentName, Kubernete payload,
+    public String updateComponent(String clusterName, String resourceType, String namespace, String applicationName, String componentName, Kubernete payload,
                                 Boolean async, boolean rollbackOnFail, int timeout) throws IOException, InterruptedException {
+        String componentID = payload.getMetadata().getLabels().getOrDefault("service.alauda.io/uuid", "");
         componentClient.updateComponent(clusterName, resourceType, namespace, componentName, payload);
-        return componentName;
+
+        logger.printf("updateComponent: %s has been started. Show the details -> %s %n", componentName,
+                getAlaudaComponentURL(componentID));
+        if (async) {
+            return componentName;
+        }
+
+        logger.println("waiting for the component to update is complete...");
+        boolean isSucceed = monitorUpdateComponent(clusterName, namespace, applicationName, resourceType, componentName, timeout);
+        if (isSucceed) {
+            return componentName;
+        } else {
+            throw new InterruptedException(String.format("Update Component %s failed!", componentName));
+        }
+    }
+
+    private String getAlaudaComponentURL(String componentID) throws IOException {
+        return AlaudaPath.getComponentUrl(this.getConsoleURL(), componentID);
     }
 
     // region Service operation
@@ -571,6 +627,10 @@ public class Alauda {
 
         public static String getServiceUrl(String endpoint, String serviceID) throws IOException {
             return AlaudaPath.combine(endpoint, String.format("/console/k8s_service/detail/%s", serviceID));
+        }
+
+        public static String getComponentUrl(String endpoint, String componentID) throws IOException {
+            return AlaudaPath.combine(endpoint, String.format("/console/k8s_app/detail/component/%s", componentID));
         }
 
         public static String combine(String baseUrl, String relativeUrl) throws IOException {
